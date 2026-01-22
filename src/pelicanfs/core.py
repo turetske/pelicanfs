@@ -1,5 +1,5 @@
 """
-Copyright (C) 2024, Pelican Project, Morgridge Institute for Research
+Copyright (C) 2026, Pelican Project, Morgridge Institute for Research
 
 Licensed under the Apache License, Version 2.0 (the "License"); you
 may not use this file except in compliance with the License.  You may
@@ -19,6 +19,7 @@ import functools
 import logging
 import re
 import threading
+import time
 import urllib.parse
 from contextlib import asynccontextmanager
 from copy import copy
@@ -125,9 +126,13 @@ class _CacheManager(object):
     Each entry in the namespace has an associated list of caches that are willing
     to provide services to the client.  As the caches are used, if they timeout
     or otherwise cause errors, they should be skipped for future operations.
+
+    Bad caches are recovered after a TTL period (default 120 seconds) to handle
+    transient failures. The namespace cache TTL (15 minutes) ensures periodic
+    refresh of the full cache list from the director.
     """
 
-    def __init__(self, cache_list, director_response=None):
+    def __init__(self, cache_list, director_response=None, bad_cache_ttl=120):
         """
         Construct a new cache manager from an ordered list of cache URLs.
         The cache URL is assumed to have the form of:
@@ -140,9 +145,12 @@ class _CacheManager(object):
         Args:
             cache_list: List of cache URL strings
             director_response: DirectorResponse object containing namespace information
+            bad_cache_ttl: Seconds before a bad cache can be retried (default 120)
         """
         self._lock = threading.Lock()
         self._cache_list = []
+        self._bad_caches = {}  # {cache_url: timestamp_marked_bad}
+        self._bad_cache_ttl = bad_cache_ttl
         self.director_response = director_response
         # Work around any bugs where the director may return the same cache twice
         cache_set = set()
@@ -160,20 +168,34 @@ class _CacheManager(object):
         Given an object name, return the currently-preferred cache
         """
         with self._lock:
+            self._recover_expired_caches()
             if not self._cache_list:
                 raise NoAvailableSource()
 
             return urllib.parse.urljoin(self._cache_list[0], obj_name)
 
+    def _recover_expired_caches(self):
+        """Move caches from bad list back to active list if their TTL has expired."""
+        now = time.time()
+        expired = [url for url, ts in list(self._bad_caches.items()) if now - ts > self._bad_cache_ttl]
+        for url in expired:
+            self._cache_list.append(url)
+            del self._bad_caches[url]
+            logger.debug(f"Recovered cache {url} after {self._bad_cache_ttl}s TTL expiry")
+
     def bad_cache(self, cache_url: str):
         """
-        Remove the given cache_url from the list of possible caches to try
+        Mark the given cache_url as temporarily bad.
+        It will be recovered after bad_cache_ttl seconds.
         """
         cache_url_parsed = urllib.parse.urlparse(cache_url)
         cache_url_parsed = cache_url_parsed._replace(path="", query="", fragment="")
         bad_cache_url = cache_url_parsed.geturl()
         with self._lock:
-            self._cache_list.remove(bad_cache_url)
+            if bad_cache_url in self._cache_list:
+                self._cache_list.remove(bad_cache_url)
+                self._bad_caches[bad_cache_url] = time.time()
+                logger.debug(f"Marked cache {bad_cache_url} as bad, will retry after {self._bad_cache_ttl}s")
 
 
 @asynccontextmanager
