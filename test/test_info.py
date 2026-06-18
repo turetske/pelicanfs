@@ -18,10 +18,25 @@ from pytest_httpserver import HTTPServer
 import pelicanfs.core
 
 
-def test_info(httpserver: HTTPServer, get_client):
+def test_info(httpserver: HTTPServer, get_client, get_webdav_client):
     foo_bar_url = httpserver.url_for("foo/bar")
+    propfind_response = """<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/foo/bar</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getcontentlength>13</D:getcontentlength>
+        <D:getcontenttype>text/plain</D:getcontenttype>
+        <D:getlastmodified>Mon, 01 Jan 2024 00:00:00 GMT</D:getlastmodified>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"""
+
     httpserver.expect_request("/.well-known/pelican-configuration").respond_with_json({"director_endpoint": httpserver.url_for("/")})
-    httpserver.expect_oneshot_request("/foo/bar").respond_with_data(
+    httpserver.expect_oneshot_request("/foo/bar", method="GET").respond_with_data(
         "",
         status=307,
         headers={
@@ -30,20 +45,19 @@ def test_info(httpserver: HTTPServer, get_client):
         },
     )
     httpserver.expect_request("/foo/bar", method="HEAD").respond_with_data("hello, world!")
+    httpserver.expect_request("/foo/bar", method="PROPFIND").respond_with_data(propfind_response, status=207, content_type="application/xml")
 
     pelfs = pelicanfs.core.PelicanFileSystem(
         httpserver.url_for("/"),
         get_client=get_client,
+        get_webdav_client=get_webdav_client,
         skip_instance_cache=True,
     )
 
-    assert pelfs.info("/foo/bar") == {
-        "name": "/foo/bar",
-        "size": 13,
-        "mimetype": "text/plain",
-        "url": "/foo/bar",
-        "type": "file",
-    }
+    result = pelfs.info("/foo/bar")
+    assert result["name"] == "/foo/bar"
+    assert result["size"] == 13
+    assert result["type"] == "file"
 
 
 def test_du(

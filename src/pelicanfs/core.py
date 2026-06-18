@@ -175,7 +175,10 @@ class _CacheManager(object):
         cache_url_parsed = cache_url_parsed._replace(path="", query="", fragment="")
         bad_cache_url = cache_url_parsed.geturl()
         with self._lock:
-            self._cache_list.remove(bad_cache_url)
+            try:
+                self._cache_list.remove(bad_cache_url)
+            except ValueError:
+                pass
 
 
 @asynccontextmanager
@@ -1237,7 +1240,12 @@ class PelicanFileSystem(AsyncFileSystem):
 
     @_cache_dec
     async def _exists(self, path, **kwargs):
-        return await self.http_file_system._exists(path, **kwargs)
+        parts = urllib.parse.urlparse(path)
+        base_url = f"{parts.scheme}://{parts.netloc}"
+        webdav_token = self.token.removeprefix("Bearer ") if self.token else None
+        options = {"hostname": base_url, "token": webdav_token}
+        async with self.get_webdav_client(options) as client:
+            return await client.check(parts.path)
 
     @_cache_dec
     async def _get_file(self, rpath, lpath, **kwargs):
@@ -1245,8 +1253,23 @@ class PelicanFileSystem(AsyncFileSystem):
 
     @_cache_dec
     async def _info(self, path, **kwargs):
-        results = await self.http_file_system._info(path, **kwargs)
-        return self._remove_host_from_paths(results)
+        parts = urllib.parse.urlparse(path)
+        base_url = f"{parts.scheme}://{parts.netloc}"
+        webdav_token = self.token.removeprefix("Bearer ") if self.token else None
+        options = {"hostname": base_url, "token": webdav_token}
+        async with self.get_webdav_client(options) as client:
+            try:
+                result = await client.info(parts.path)
+            except RemoteResourceNotFoundError:
+                raise FileNotFoundError(path)
+            info = {
+                "name": path,
+                "type": "file",
+                "size": int(result.get("size", 0)),
+                "mimetype": result.get("content_type", ""),
+                "mtime": result.get("modified", ""),
+            }
+            return self._remove_host_from_paths(info)
 
     @_cache_dec
     async def _get(self, rpath, lpath, **kwargs):
