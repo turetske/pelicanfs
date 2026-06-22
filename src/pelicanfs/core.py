@@ -175,10 +175,8 @@ class _CacheManager(object):
         cache_url_parsed = cache_url_parsed._replace(path="", query="", fragment="")
         bad_cache_url = cache_url_parsed.geturl()
         with self._lock:
-            try:
+            if bad_cache_url in self._cache_list:
                 self._cache_list.remove(bad_cache_url)
-            except ValueError:
-                pass
 
 
 @asynccontextmanager
@@ -1156,6 +1154,8 @@ class PelicanFileSystem(AsyncFileSystem):
             try:
                 logger.debug(f"Calling {func} using the following url: {data_url}")
                 result = await func(self, data_url, *args[1:], **kwargs)
+            except FileNotFoundError:
+                raise
             except Exception as e:
                 if not self.direct_reads:
                     self._bad_cache(data_url, e)
@@ -1213,6 +1213,8 @@ class PelicanFileSystem(AsyncFileSystem):
             try:
                 logger.debug(f"Calling {func} using the following urls: {data_url}")
                 result = await func(self, data_url, *args[1:], **kwargs)
+            except FileNotFoundError:
+                raise
             except Exception as e:
                 if not self.direct_reads:
                     if isinstance(data_url, list):
