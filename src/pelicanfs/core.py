@@ -726,6 +726,8 @@ class PelicanFileSystem(AsyncFileSystem):
         the corresponding cache as a "bad cache" in the namespace
         cache.
         """
+        if isinstance(e, FileNotFoundError):
+            return
         logger.debug(f"Marking cache at {url} as bad")
         cache_url = urllib.parse.urlparse(url)
         path = cache_url.path
@@ -1004,7 +1006,7 @@ class PelicanFileSystem(AsyncFileSystem):
 
         async def io_wrapper(*args, **kwargs):
             try:
-                return func(*args, **kwargs)
+                return await func(*args, **kwargs)
             except Exception as e:
                 self._bad_cache(path, e)
                 raise
@@ -1154,8 +1156,6 @@ class PelicanFileSystem(AsyncFileSystem):
             try:
                 logger.debug(f"Calling {func} using the following url: {data_url}")
                 result = await func(self, data_url, *args[1:], **kwargs)
-            except FileNotFoundError:
-                raise
             except Exception as e:
                 if not self.direct_reads:
                     self._bad_cache(data_url, e)
@@ -1213,8 +1213,6 @@ class PelicanFileSystem(AsyncFileSystem):
             try:
                 logger.debug(f"Calling {func} using the following urls: {data_url}")
                 result = await func(self, data_url, *args[1:], **kwargs)
-            except FileNotFoundError:
-                raise
             except Exception as e:
                 if not self.direct_reads:
                     if isinstance(data_url, list):

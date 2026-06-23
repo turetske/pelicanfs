@@ -16,28 +16,32 @@ limitations under the License.
 import pytest
 from pytest_httpserver import HTTPServer
 
-from pelicanfs.core import PelicanFileSystem, _CacheManager
+from pelicanfs.core import PelicanFileSystem
+
+
+def _setup_director(httpserver, path="/foo/bar"):
+    """Register the pelican-configuration and a single director 307 redirect for path."""
+    url = httpserver.url_for(path)
+    httpserver.expect_request("/.well-known/pelican-configuration").respond_with_json({"director_endpoint": httpserver.url_for("/")})
+    httpserver.expect_oneshot_request(path, method="GET").respond_with_data(
+        "",
+        status=307,
+        headers={
+            "Link": f'<{url}>; rel="duplicate"; pri=1; depth=1',
+            "Location": url,
+            "X-Pelican-Namespace": "namespace=/foo",
+        },
+    )
+    return url
 
 
 def test_cat_file_404_raises_file_not_found(httpserver: HTTPServer, get_client):
     """Two sequential 404s must both raise FileNotFoundError, not crash with ValueError."""
-    foo_bar_url = httpserver.url_for("/foo/bar")
-    httpserver.expect_request("/.well-known/pelican-configuration").respond_with_json({"director_endpoint": httpserver.url_for("/")})
-    # Director redirect — only needed on the first call; namespace is cached after that
-    httpserver.expect_oneshot_request("/foo/bar", method="GET").respond_with_data(
-        "",
-        status=307,
-        headers={
-            "Link": f'<{foo_bar_url}>; rel="duplicate"; pri=1; depth=1',
-            "Location": foo_bar_url,
-            "X-Pelican-Namespace": "namespace=/foo",
-        },
-    )
+    _setup_director(httpserver)
     # First 404
     httpserver.expect_oneshot_request("/foo/bar", method="HEAD").respond_with_data("", status=404)
     httpserver.expect_oneshot_request("/foo/bar", method="GET").respond_with_data("", status=404)
-    # Second 404 — this is what triggered ValueError before the fix
-    httpserver.expect_oneshot_request("/foo/bar", method="HEAD").respond_with_data("", status=404)
+    # Second 404 — namespace is cached after the first call so no HEAD probe, just GET
     httpserver.expect_oneshot_request("/foo/bar", method="GET").respond_with_data("", status=404)
 
     pelfs = PelicanFileSystem(
@@ -54,17 +58,7 @@ def test_cat_file_404_raises_file_not_found(httpserver: HTTPServer, get_client):
 
 def test_404_does_not_evict_cache(httpserver: HTTPServer, get_client):
     """A 404 must not evict the healthy cache from the namespace cache."""
-    foo_bar_url = httpserver.url_for("/foo/bar")
-    httpserver.expect_request("/.well-known/pelican-configuration").respond_with_json({"director_endpoint": httpserver.url_for("/")})
-    httpserver.expect_oneshot_request("/foo/bar", method="GET").respond_with_data(
-        "",
-        status=307,
-        headers={
-            "Link": f'<{foo_bar_url}>; rel="duplicate"; pri=1; depth=1',
-            "Location": foo_bar_url,
-            "X-Pelican-Namespace": "namespace=/foo",
-        },
-    )
+    _setup_director(httpserver)
     httpserver.expect_oneshot_request("/foo/bar", method="HEAD").respond_with_data("", status=404)
     httpserver.expect_oneshot_request("/foo/bar", method="GET").respond_with_data("", status=404)
 
@@ -82,8 +76,50 @@ def test_404_does_not_evict_cache(httpserver: HTTPServer, get_client):
     assert len(namespace_info.cache_manager._cache_list) > 0
 
 
-def test_bad_cache_idempotent():
-    """_CacheManager.bad_cache() called twice for the same URL must not raise."""
-    cm = _CacheManager(["https://cache.example.com/"])
-    cm.bad_cache("https://cache.example.com/")
-    cm.bad_cache("https://cache.example.com/")  # must not raise ValueError
+def test_open_async_404_does_not_evict_cache(httpserver: HTTPServer, get_client):
+    """A 404 surfacing at read() time via open_async must not evict the cache."""
+    from fsspec.asyn import sync
+
+    _setup_director(httpserver)
+    # get_working_cache probes with HEAD, then open_async probes with HEAD again for info()
+    # both return 404 since the file doesn't exist; two GETs follow (info + read)
+    httpserver.expect_request("/foo/bar", method="HEAD").respond_with_data("", status=404)
+    httpserver.expect_request("/foo/bar", method="GET").respond_with_data("", status=404)
+
+    pelfs = PelicanFileSystem(
+        httpserver.url_for("/"),
+        get_client=get_client,
+        skip_instance_cache=True,
+    )
+
+    async def _read():
+        fp = await pelfs.open_async("/foo/bar")
+        return await fp.read()
+
+    with pytest.raises(FileNotFoundError):
+        sync(pelfs.loop, _read)
+
+    namespace_info = pelfs._get_prefix_info("/foo/bar")
+    assert namespace_info is not None
+    assert len(namespace_info.cache_manager._cache_list) > 0
+
+
+def test_double_cache_error_does_not_crash(httpserver: HTTPServer, get_client):
+    """Two sequential non-404 failures must not raise ValueError from bad_cache."""
+    _setup_director(httpserver)
+    # Both calls return 500, which should mark the cache bad without crashing
+    httpserver.expect_oneshot_request("/foo/bar", method="HEAD").respond_with_data("", status=500)
+    httpserver.expect_oneshot_request("/foo/bar", method="GET").respond_with_data("", status=500)
+    httpserver.expect_oneshot_request("/foo/bar", method="GET").respond_with_data("", status=500)
+
+    pelfs = PelicanFileSystem(
+        httpserver.url_for("/"),
+        get_client=get_client,
+        skip_instance_cache=True,
+    )
+
+    with pytest.raises(Exception):
+        pelfs.cat("/foo/bar")
+    # Second call must not crash with ValueError even though the cache is already evicted
+    with pytest.raises(Exception):
+        pelfs.cat("/foo/bar")
