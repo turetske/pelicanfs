@@ -17,6 +17,7 @@ limitations under the License.
 import asyncio
 import functools
 import logging
+import os
 import re
 import threading
 import urllib.parse
@@ -24,6 +25,7 @@ from contextlib import asynccontextmanager
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime
+from glob import has_magic
 from pathlib import PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
@@ -32,8 +34,10 @@ import cachetools
 import fsspec.implementations.http as fshttp
 from aiowebdav2.client import Client, ClientOptions
 from aiowebdav2.exceptions import RemoteResourceNotFoundError, ResponseErrorCodeError
-from fsspec.asyn import AsyncFileSystem, sync
-from fsspec.utils import glob_translate
+from fsspec.asyn import AsyncFileSystem, _run_coros_in_chunks, sync
+from fsspec.callbacks import DEFAULT_CALLBACK
+from fsspec.implementations.local import LocalFileSystem, make_path_posix, trailing_sep
+from fsspec.utils import glob_translate, other_paths
 
 from .dir_header_parser import (
     DirectorResponse,
@@ -1276,19 +1280,14 @@ class PelicanFileSystem(AsyncFileSystem):
         without maxdepth, directories are passed to _get_file which tries to GET them,
         causing 403 errors on cache servers that don't serve directories via GET.
         """
-        import os
-        from glob import has_magic
-
-        from fsspec.callbacks import DEFAULT_CALLBACK
-        from fsspec.implementations.local import (
-            LocalFileSystem,
-            make_path_posix,
-            trailing_sep,
-        )
-        from fsspec.utils import other_paths
-
         if callback is None:
             callback = DEFAULT_CALLBACK
+
+        # List inputs need no path expansion and are not str-safe for _check_fspath
+        # (which runs urlparse). Delegate to the base implementation, whose per-file
+        # _get_file call is cache- and token-aware via _cache_dec.
+        if isinstance(rpath, list) and isinstance(lpath, list):
+            return await super()._get(rpath, lpath, recursive=recursive, callback=callback, maxdepth=maxdepth, **kwargs)
 
         path = self._check_fspath(rpath)
         trace(logger, "_get path=%s recursive=%s", path, recursive)
@@ -1308,53 +1307,46 @@ class PelicanFileSystem(AsyncFileSystem):
         trace(logger, "_get token after generation=%s", format_token_for_log(self.token))
         trace(logger, "_get expanding path")
 
-        # Now perform the actual _get logic with directory filtering
-        if isinstance(lpath, list) and isinstance(rpath, list):
-            # No need to expand paths when both source and destination
-            # are provided as lists
-            rpaths = rpath
-            lpaths = lpath
-        else:
-            source_is_str = isinstance(rpath, str)
-            # First check for rpath trailing slash as _strip_protocol removes it
-            source_not_trailing_sep = source_is_str and not trailing_sep(rpath)
+        source_is_str = isinstance(rpath, str)
+        # First check for rpath trailing slash as _strip_protocol removes it
+        source_not_trailing_sep = source_is_str and not trailing_sep(rpath)
 
-            # Use the data_url (cache URL) for expansion
-            rpaths = await self.http_file_system._expand_path(data_url, recursive=recursive, maxdepth=maxdepth)
+        # Use the data_url (cache URL) for expansion
+        rpaths = await self.http_file_system._expand_path(data_url, recursive=recursive, maxdepth=maxdepth)
 
-            # CRITICAL FIX: Always filter out directories to prevent 403 errors
-            # when trying to GET a directory from the cache server.
-            # The base fsspec only filters when `not recursive or maxdepth is not None`,
-            # but cache servers return 403 for directory GET requests.
-            if source_is_str:
-                filtered_rpaths = []
-                for p in rpaths:
-                    if trailing_sep(p):
-                        continue
-                    is_dir = await self.http_file_system._isdir(p)
-                    if is_dir:
-                        continue
-                    filtered_rpaths.append(p)
-                rpaths = filtered_rpaths
-                if not rpaths:
-                    return
+        # CRITICAL FIX: Always filter out directories to prevent 403 errors
+        # when trying to GET a directory from the cache server.
+        # The base fsspec only filters when `not recursive or maxdepth is not None`,
+        # but cache servers return 403 for directory GET requests.
+        if source_is_str:
+            candidates = [p for p in rpaths if not trailing_sep(p)]
+            # Resolve directory status concurrently; a serial loop would issue one
+            # blocking director-lookup + PROPFIND per path before any transfer starts.
+            is_dir_flags = await asyncio.gather(*(self.http_file_system._isdir(p) for p in candidates))
+            rpaths = [p for p, is_dir in zip(candidates, is_dir_flags) if not is_dir]
+            if not rpaths:
+                return
 
-            lpath = make_path_posix(lpath)
-            source_is_file = len(rpaths) == 1
-            dest_is_dir = isinstance(lpath, str) and (trailing_sep(lpath) or LocalFileSystem().isdir(lpath))
+        lpath = make_path_posix(lpath)
+        source_is_file = len(rpaths) == 1
+        dest_is_dir = isinstance(lpath, str) and (trailing_sep(lpath) or LocalFileSystem().isdir(lpath))
 
-            exists = source_is_str and ((has_magic(data_url) and source_is_file) or (not has_magic(data_url) and dest_is_dir and source_not_trailing_sep))
-            lpaths = other_paths(
-                rpaths,
-                lpath,
-                exists=exists,
-                flatten=not source_is_str,
-            )
+        # Key `exists` on the protocol-stripped source path, never on data_url (and
+        # not the raw rpath): the resolved cache/origin URL -- or a federation host
+        # such as an IPv6 literal -- routinely carries query strings or brackets that
+        # has_magic misreads as glob magic, corrupting the destination mapping. This
+        # matches fsspec's base _get, which keys on the stripped source path.
+        exists = source_is_str and ((has_magic(path) and source_is_file) or (not has_magic(path) and dest_is_dir and source_not_trailing_sep))
+        lpaths = other_paths(
+            rpaths,
+            lpath,
+            exists=exists,
+            flatten=not source_is_str,
+        )
 
-        [os.makedirs(os.path.dirname(lp), exist_ok=True) for lp in lpaths]
+        for lp in lpaths:
+            os.makedirs(os.path.dirname(lp), exist_ok=True)
         batch_size = kwargs.pop("batch_size", self.http_file_system.batch_size)
-
-        from fsspec.asyn import _run_coros_in_chunks
 
         coros = []
         callback.set_size(len(lpaths))
