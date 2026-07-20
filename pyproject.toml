@@ -61,6 +61,7 @@ testing = [
 addopts = [
     "--import-mode=importlib",
 ]
+pythonpath = ["test"]
 markers = [
     "integration: marks tests as integration tests (require live OSDF infrastructure)",
 ]
