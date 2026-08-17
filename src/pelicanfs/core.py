@@ -241,15 +241,21 @@ async def get_webdav_client(options):
     """
     Yield a WebDAV client for the host in "options", releasing the responses it produces.
 
-    Recognised options are "hostname", the base URL to talk to, and "token", the bearer
-    token to authenticate with.
+    Recognised options are "hostname", the base URL to talk to, "token", the bearer token
+    to authenticate with, and "verify_ssl", which defaults to verifying.
+
+    "verify_ssl" is handed to aiohttp as the request's "ssl" argument, so it takes a
+    boolean or anything else aiohttp accepts there, including an ssl.SSLContext - which is
+    how the test suite points a client at its own CA. Note that aiowebdav2 annotates the
+    option as a bool even though it only forwards it, so a type checker will object to a
+    context here.
     """
     base_url = options["hostname"]
     token = options["token"]
 
     responses: List[aiohttp.ClientResponse] = []
     session = aiohttp.ClientSession(headers={"Authorization": f"Bearer {token}"}, trace_configs=[_recycle_responses(responses)])
-    clientopts = ClientOptions(session=session)
+    clientopts = ClientOptions(session=session, verify_ssl=options.get("verify_ssl", True))
     client = Client(url=base_url, username="", password="", options=clientopts)
     client._close_session = True
 
