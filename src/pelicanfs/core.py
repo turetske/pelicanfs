@@ -179,12 +179,76 @@ class _CacheManager(object):
                 self._cache_list.remove(bad_cache_url)
 
 
+def _recycle_responses(responses: List[aiohttp.ClientResponse]) -> aiohttp.TraceConfig:
+    """
+    Return a trace config that keeps a session from holding on to its responses.
+
+    aiowebdav2 hands back raw aiohttp responses and does not reliably release them.
+    Client.check, which backs exists(), only looks at response.status, and
+    execute_request abandons the response altogether when it raises for an error status
+    (401, 403, 404, 405, 423 and 507). A response that is never released keeps its
+    connection checked out until it is garbage collected, at which point aiohttp reports
+    an "Unclosed connection".
+
+    So each response is recorded as it arrives, and released once the next request begins.
+    Every aiowebdav2 method issues one request and has finished with its response by the
+    time it returns, so a new request starting is proof the last one is done with. At most
+    one response is held at a time as a result, for as many calls as a client is asked to
+    serve and for as long as it is kept. Releasing only when the client closed would
+    instead keep every connection checked out and every body resident until then, which is
+    the leak this is meant to prevent rather than defer.
+
+    This assumes one request at a time per client, which is how pelicanfs uses them: each
+    call to exists() and info() gets a client of its own, and a listing makes its two
+    requests one after the other. Issuing concurrent requests through a single client
+    would break the assumption, since the second to start would release the first's
+    response while it was still being read.
+
+    The one method this reasoning does not cover is download_iter, which returns a
+    generator over its response, so the response outlives the call. pelicanfs does not use
+    it; a caller who does must not start another request on the same client until they
+    have finished consuming the generator.
+    """
+    trace_config = aiohttp.TraceConfig()
+
+    async def on_request_start(session, context, params):
+        _release_responses(responses)
+
+    async def on_request_end(session, context, params):
+        responses.append(params.response)
+
+    trace_config.on_request_start.append(on_request_start)
+    trace_config.on_request_end.append(on_request_end)
+    return trace_config
+
+
+def _release_responses(responses: List[aiohttp.ClientResponse]) -> None:
+    """
+    Release the recorded responses, freeing the connections they hold, and forget them.
+
+    This releases rather than reads the bodies, since a body may be arbitrarily large and
+    is of no interest by this point. The cost is that aiohttp closes a connection whose
+    body was left unread instead of returning it to the pool, so repeated check() calls on
+    one client each pay a fresh handshake. The bodies pelicanfs actually wants are read by
+    aiowebdav2 itself, and releasing those is a no-op that leaves them pooled as normal.
+    """
+    while responses:
+        responses.pop().release()
+
+
 @asynccontextmanager
 async def get_webdav_client(options):
+    """
+    Yield a WebDAV client for the host in "options", releasing the responses it produces.
+
+    Recognised options are "hostname", the base URL to talk to, and "token", the bearer
+    token to authenticate with.
+    """
     base_url = options["hostname"]
     token = options["token"]
 
-    session = aiohttp.ClientSession(headers={"Authorization": f"Bearer {token}"})
+    responses: List[aiohttp.ClientResponse] = []
+    session = aiohttp.ClientSession(headers={"Authorization": f"Bearer {token}"}, trace_configs=[_recycle_responses(responses)])
     clientopts = ClientOptions(session=session)
     client = Client(url=base_url, username="", password="", options=clientopts)
     client._close_session = True
@@ -192,8 +256,14 @@ async def get_webdav_client(options):
     try:
         yield client
     finally:
-        await client.close()
-        logger.debug("WebDAV client closed")
+        # The last response has no following request to release it, so it is released
+        # here. Guarded so that a failure to release still closes the client, rather than
+        # leaking the whole session on the way out.
+        try:
+            _release_responses(responses)
+        finally:
+            await client.close()
+            logger.debug("WebDAV client closed")
 
 
 def sync_generator(async_gen_func, obj=None):
