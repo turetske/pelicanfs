@@ -13,11 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
 import pytest
+from aiowebdav2.exceptions import UnauthorizedError
+from fsspec.asyn import sync
 from pytest_httpserver import HTTPServer
 
 import pelicanfs.core
 from pelicanfs.exceptions import NoCollectionsUrl
+from pelicanfs.token_generator import TokenGenerator
 
 
 def test_no_collections_url(httpserver: HTTPServer, get_client):
@@ -402,3 +406,60 @@ def test_walk(
             assert False, "Should not have reached this point, too many subdirectories"
 
         sentinel += 1
+
+
+def test_ls_from_http_awaits_token_generation(httpserver: HTTPServer, get_client, get_webdav_client, f2_listing_response, monkeypatch):
+    """
+    _ls_from_http has to await _handle_token_generation.
+
+    Called without awaiting it builds a coroutine that is then discarded, so the token is
+    never generated and never recorded on the filesystem. The listing that follows in the
+    same call then goes out unauthenticated, which on a namespace that requires a token
+    fails - with a RuntimeWarning as the only clue about why.
+
+    The PROPFIND below is registered as only matching a request that carries the generated
+    token, and anything else reaching that path is answered the way a server guarding it
+    would answer, with a 401. So the server is what decides whether the token really was
+    applied. Only the OIDC device flow is stubbed out; the director exchange,
+    _handle_token_generation and the WebDAV listing are all the real thing.
+    """
+    collections_url = httpserver.url_for("/foo/bar")
+    monkeypatch.setattr(TokenGenerator, "get_token", lambda self: "generated-token")
+
+    httpserver.expect_request("/.well-known/pelican-configuration").respond_with_json({"director_endpoint": httpserver.url_for("/")})
+    httpserver.expect_oneshot_request("/foo/bar").respond_with_data(
+        "",
+        status=307,
+        headers={
+            "Link": f'<{collections_url}>; rel="duplicate"; pri=1; depth=1',
+            "X-Pelican-Namespace": f"namespace=/foo, collections-url={collections_url}, require-token=true",
+        },
+    )
+    httpserver.expect_request(
+        "/foo/bar/",
+        method="PROPFIND",
+        headers={"Authorization": "Bearer generated-token"},
+    ).respond_with_data(f2_listing_response)
+    # Registered second, so it only picks up what the matcher above turned down.
+    httpserver.expect_request("/foo/bar/", method="PROPFIND").respond_with_data("", status=401)
+
+    pelfs = pelicanfs.core.PelicanFileSystem(
+        httpserver.url_for("/"),
+        get_client=get_client,
+        get_webdav_client=get_webdav_client,
+        skip_instance_cache=True,
+    )
+    assert pelfs.token is None, "this test only means something if the token has to be generated"
+
+    # Driven through fsspec's loop, the way every other entry point into this filesystem
+    # reaches it; asyncio.run would build a second loop and the client sessions are bound
+    # to the first one.
+    try:
+        listing = sync(pelfs.loop, pelfs._ls_from_http, httpserver.url_for("/foo/bar"))
+    except UnauthorizedError:
+        pytest.fail("the PROPFIND went out with no token, so _handle_token_generation was never awaited")
+
+    assert pelfs.token == "Bearer generated-token", "no token was recorded, so _handle_token_generation was never awaited"
+    names = [entry["name"] for entry in listing]
+    assert f"{collections_url}/folder2/file1.md" in names, "the token-gated PROPFIND did not match, so the listing went out unauthenticated"
+    assert f"{collections_url}/folder2/file2.md" in names
