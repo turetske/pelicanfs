@@ -233,3 +233,31 @@ def test_webdav_client_releases_the_response_on_an_error_status(httpserver: HTTP
 
     assert finalised, "no connection to the test server was finalised, so this observed nothing"
     assert leaked == [], "the response was not released, so its connection leaked"
+
+
+def test_webdav_client_does_not_hoard_connections_across_calls(threaded_httpserver: HTTPServer, httpclient_ssl_context):
+    """
+    A reused client must not accumulate connections, only ever holding the latest response.
+
+    Nothing bounds how many calls a client serves or how long it is kept, so releasing
+    only when it closes would keep every connection checked out and every body resident
+    until then. That is the leak this is meant to prevent rather than defer to later, and
+    it would not show up in the tests above, which close the client before looking at
+    anything.
+
+    This one needs the threaded server: held-open connections are exactly what it is
+    looking for, and the single-threaded one stops serving while any are held.
+    """
+    threaded_httpserver.clear()
+    expect_propfind(threaded_httpserver, status=207)
+
+    async def held_after_each_of_several_calls():
+        held = []
+        async with pelicanfs.core.get_webdav_client(webdav_options(threaded_httpserver, httpclient_ssl_context)) as client:
+            for _ in range(3):
+                assert await client.check("/foo/bar") is True
+                held.append(connections_held_by(client))
+        return held
+
+    held = asyncio.run(held_after_each_of_several_calls())
+    assert held == [1, 1, 1], f"connections accumulated across calls instead of being recycled: {held}"

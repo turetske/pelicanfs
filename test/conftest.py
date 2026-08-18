@@ -66,6 +66,31 @@ def fixture_httpserver2(httpserver_listen_address, httpserver_ssl_context):
         server.stop()
 
 
+@pytest.fixture(scope="session", name="threaded_httpserver")
+def fixture_threaded_httpserver(httpserver_listen_address, httpserver_ssl_context):
+    """
+    A server that serves connections in parallel rather than one at a time.
+
+    The default server is single threaded, so a connection left open blocks the next
+    request from being served at all. A test that checks connections are not being held
+    open needs to make a second request while the first would still be held, and against
+    the default server that request waits for aiohttp's connect timeout and fails on
+    that instead of on the thing it set out to assert.
+    """
+    host, port = httpserver_listen_address
+    if not host:
+        host = HTTPServer.DEFAULT_LISTEN_HOST
+    if not port:
+        port = HTTPServer.DEFAULT_LISTEN_PORT
+
+    server = HTTPServer(host=host, port=port, ssl_context=httpserver_ssl_context, threaded=True)
+    server.start()
+    yield server
+    server.clear()
+    if server.is_running():
+        server.stop()
+
+
 @pytest.fixture(scope="session", name="get_client")
 def fixture_get_client(httpclient_ssl_context):
     async def client_factory(**kwargs):
