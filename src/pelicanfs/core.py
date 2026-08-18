@@ -867,7 +867,7 @@ class PelicanFileSystem(AsyncFileSystem):
 
         # Handle token generation if required
         operation = self._get_token_operation("_ls")
-        self._handle_token_generation(collections_url, director_response, operation)
+        await self._handle_token_generation(collections_url, director_response, operation)
 
         # Call _ls_real with the collections URL
         if self.use_listings_cache and collections_url in self.dircache:
